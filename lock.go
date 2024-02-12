@@ -26,6 +26,44 @@ func NewClient(client redis.Cmdable) *Client {
 	}
 }
 
+func (c *Client) Lock(ctx context.Context, key string,
+	expiration time.Duration, retry RetryStrategy, timeout time.Duration) (*Lock, error) {
+	val := uuid.New().String()
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		lctx, cancel := context.WithTimeout(ctx, timeout)
+		res, err := c.client.Eval(lctx, luaLock, []string{key},
+			val, expiration).Bool()
+		cancel()
+
+		if err != nil && errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		if res {
+			return newLock(c.client, key, val, expiration), nil
+		}
+		interval, ok := retry.Next()
+		if !ok {
+			return nil, ErrFailedToPreemptLock
+		}
+
+		if timer == nil {
+			timer = time.NewTimer(interval)
+		}
+		timer.Reset(interval)
+		select {
+		case <-timer.C: // 继续执行
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
 func (c *Client) TryLock(ctx context.Context, key string,
 	expiration time.Duration) (*Lock, error) {
 	val := uuid.New().String()
@@ -44,6 +82,8 @@ var (
 	luaUnLock string
 	//go:embed script/lua/refresh.lua
 	luaRefresh string
+	//go:embed script/lua/lock.lua
+	luaLock string
 )
 
 type onceCloseChan struct {
